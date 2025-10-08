@@ -3,17 +3,7 @@ import { useState, useEffect } from "react";
 import type { Address } from "viem";
 import { Field, Input, Box, Flex } from "@chakra-ui/react";
 import { getTokenInfo, buyToken, sellToken } from "@/utils/eth";
-
-// Extend Window interface for MetaMask
-declare global {
-  interface Window {
-    ethereum?: {
-      request: (args: { method: string; params?: any[] }) => Promise<any>;
-      on: (event: string, callback: (accounts: string[]) => void) => void;
-      removeListener: (event: string, callback: (accounts: string[]) => void) => void;
-    };
-  }
-}
+import { mainnet, bsc } from "viem/chains";
 
 function isValidEthAddress(address: string) {
   return /^0x[a-fA-F0-9]{40}$/.test(address);
@@ -42,6 +32,8 @@ export default function Home() {
   const [ethPriceUSD, setEthPriceUSD] = useState<number | null>(null);
   const [gasPriceGwei, setGasPriceGwei] = useState<number | null>(null);
   const [walletBalanceEth, setWalletBalanceEth] = useState<number | null>(null);
+  const [currentChainName, setCurrentChainName] = useState<string>("ETH"); // Default to ETH
+  const [isChainDropdownOpen, setIsChainDropdownOpen] = useState(false);
 
   useEffect(() => {
     // Reset on every new input
@@ -52,7 +44,7 @@ export default function Home() {
     const fetchToken = async () => {
       setLoading(true);
       try {
-        const info = await getTokenInfo(value as Address);
+        const info = await getTokenInfo(value as Address, window.ethereum.chainId ? parseInt(window.ethereum.chainId, 16) : 1);
         setTokenInfo(info);
       } catch (error) {
         console.error("Error fetching token info:", error);
@@ -79,14 +71,15 @@ export default function Home() {
   }, [value]);
 
   useEffect(() => {
-    const eventSource = new EventSource("/api/tracker");
+    const eventSource = new EventSource(`/api/tracker`);
     eventSource.onmessage = (event) => {
       const data = JSON.parse(event.data);
       setTrackerData((prev) => [...prev, data]); // Append new data to state
 
-      // Show toast notification
+      // Show toast notification with chain-specific styling
+      const chainIcon = data.chainName === "BSC" ? "🟡" : "🔷";
       setToast({
-        message: `New token: ${data.name} (${data.symbol})`,
+        message: `${chainIcon} New ${data.tokenType} token: ${data.name} (${data.symbol})`,
         type: 'success'
       });
 
@@ -96,6 +89,62 @@ export default function Home() {
 
     return () => eventSource.close();
   }, []);
+
+  useEffect(() => {
+    // This effect runs only on the client side after component mounts
+    if (typeof window !== 'undefined' && window.ethereum && walletAddress) {
+      const updateChainName = () => {
+        const chainId = window.ethereum.chainId;
+        if (chainId === '0x1') {
+          setCurrentChainName("ETH");
+        } else if (chainId === '0x38') { // 0x38 is the hexadecimal for 56 (BSC Mainnet)
+          setCurrentChainName("BNB");
+        } else {
+          setCurrentChainName("Unknown");
+        }
+      };
+
+      // Set initial chain name
+      updateChainName();
+
+      // Listen for chain changes - but don't reload the page
+      if (window.ethereum.on) {
+        window.ethereum.on('chainChanged', (chainId: string) => {
+          updateChainName();
+          // Show a toast notification about the chain change
+          const chainName = chainId === '0x38' ? 'BNB' : chainId === '0x1' ? 'ETH' : 'Unknown';
+          setToast({
+            message: `Chain changed to ${chainName}`,
+            type: 'info'
+          });
+          setTimeout(() => setToast(null), 2000);
+        });
+        return () => {
+          window.ethereum.removeListener('chainChanged', updateChainName);
+        };
+      }
+    } else {
+      setCurrentChainName("ETH"); // Default when wallet is not connected or on server
+    }
+  }, [walletAddress]);
+
+  // Close dropdown when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      const target = event.target as HTMLElement;
+      const dropdown = target.closest('[data-dropdown]');
+      if (!dropdown && isChainDropdownOpen) {
+        setIsChainDropdownOpen(false);
+      }
+    };
+
+    if (isChainDropdownOpen) {
+      document.addEventListener('mousedown', handleClickOutside);
+      return () => {
+        document.removeEventListener('mousedown', handleClickOutside);
+      };
+    }
+  }, [isChainDropdownOpen]);
 
   const toggleMessageSelection = (index: number) => {
     if (!isSelectionMode) {
@@ -174,7 +223,8 @@ export default function Home() {
       const result = await buyToken(
         value as Address,
         tradingAmount,
-        walletAddress as Address
+        walletAddress as Address,
+        window.ethereum.chainId ? parseInt(window.ethereum.chainId, 16) : 1
       );
       
       if (result.success) {
@@ -223,7 +273,8 @@ export default function Home() {
       const result = await sellToken(
         value as Address,
         tradingAmount,
-        walletAddress as Address
+        walletAddress as Address,
+        window.ethereum.chainId ? parseInt(window.ethereum.chainId, 16) : 1
       );
       
       if (result.success) {
@@ -258,6 +309,16 @@ export default function Home() {
       return;
     }
 
+    // Check if window.ethereum is actually MetaMask
+    if (!window.ethereum.isMetaMask) {
+        setToast({
+            message: "Non-MetaMask Web3 wallet detected. Please use MetaMask for full functionality.",
+            type: 'error'
+        });
+        setTimeout(() => setToast(null), 5000);
+        return;
+    }
+
     setIsConnecting(true);
     try {
       const accounts = await window.ethereum.request({
@@ -266,6 +327,7 @@ export default function Home() {
       
       if (accounts.length > 0) {
         setWalletAddress(accounts[0]);
+        
         setToast({
           message: `Wallet connected: ${accounts[0].slice(0, 6)}...${accounts[0].slice(-4)}`,
           type: 'success'
@@ -284,6 +346,12 @@ export default function Home() {
 
   const disconnectWallet = () => {
     setWalletAddress(null);
+    setSelectedMessages(new Set()); // Clear selected messages
+    setIsSelectionMode(false); // Exit selection mode
+    setEthPriceUSD(null); // Clear price data
+    setGasPriceGwei(null); // Clear gas data
+    setWalletBalanceEth(null); // Clear balance data
+    setCurrentChainName("ETH"); // Reset to default chain
     setToast({
       message: "Wallet disconnected",
       type: 'info'
@@ -295,11 +363,100 @@ export default function Home() {
     return `${address.slice(0, 6)}...${address.slice(-4)}`;
   };
 
+  const switchChain = async (chainId: string) => {
+    if (typeof window === 'undefined' || !window.ethereum) {
+      setToast({
+        message: "MetaMask not detected",
+        type: 'error'
+      });
+      setTimeout(() => setToast(null), 3000);
+      return;
+    }
+
+    try {
+      await window.ethereum.request({
+        method: 'wallet_switchEthereumChain',
+        params: [{ chainId }],
+      });
+      setIsChainDropdownOpen(false);
+      
+      // Update chain name immediately
+      const chainName = chainId === '0x38' ? 'BNB' : 'ETH';
+      setCurrentChainName(chainName);
+      
+      setToast({
+        message: `Switched to ${chainName} chain`,
+        type: 'success'
+      });
+      setTimeout(() => setToast(null), 2000);
+    } catch (error: any) {
+      // If the chain is not added to MetaMask, add it
+      if (error.code === 4902) {
+        try {
+          const chainParams = chainId === '0x38' ? {
+            chainId: '0x38',
+            chainName: 'BNB Smart Chain',
+            nativeCurrency: {
+              name: 'BNB',
+              symbol: 'BNB',
+              decimals: 18,
+            },
+            rpcUrls: ['https://bsc-dataseed.binance.org/'],
+            blockExplorerUrls: ['https://bscscan.com/'],
+          } : {
+            chainId: '0x1',
+            chainName: 'Ethereum Mainnet',
+            nativeCurrency: {
+              name: 'Ether',
+              symbol: 'ETH',
+              decimals: 18,
+            },
+            rpcUrls: ['https://mainnet.infura.io/v3/'],
+            blockExplorerUrls: ['https://etherscan.io'],
+          };
+
+          await window.ethereum.request({
+            method: 'wallet_addEthereumChain',
+            params: [chainParams],
+          });
+          setIsChainDropdownOpen(false);
+          
+          // Update chain name after adding
+          const chainName = chainId === '0x38' ? 'BNB' : 'ETH';
+          setCurrentChainName(chainName);
+          
+          setToast({
+            message: `Added and switched to ${chainName} chain`,
+            type: 'success'
+          });
+          setTimeout(() => setToast(null), 2000);
+        } catch (addError) {
+          setToast({
+            message: "Failed to add chain to MetaMask",
+            type: 'error'
+          });
+          setTimeout(() => setToast(null), 3000);
+        }
+      } else {
+        setToast({
+          message: "Failed to switch chain",
+          type: 'error'
+        });
+        setTimeout(() => setToast(null), 3000);
+      }
+    }
+  };
+
+
   // SSE subscription for stats (price, gas, balance)
   useEffect(() => {
+    if (!walletAddress) {
+      return; // Do not start EventSource if wallet is not connected
+    }
+    const currentChainId = window.ethereum?.chainId ? parseInt(window.ethereum.chainId, 16) : 1;
     const url = walletAddress
-      ? `/api/tracker?type=stats&address=${walletAddress}`
-      : `/api/tracker?type=stats`;
+      ? `/api/tracker?type=stats&address=${walletAddress}&chainId=${currentChainId}`
+      : `/api/tracker?type=stats&chainId=${currentChainId}`;
     const es = new EventSource(url);
     es.onmessage = (evt) => {
       try {
@@ -307,7 +464,7 @@ export default function Home() {
         if (msg?.type === "stats") {
           setEthPriceUSD(msg.ethPriceUsd ?? null);
           setGasPriceGwei(msg.gasPriceGwei ?? null);
-          setWalletBalanceEth(msg.balanceEth ?? null);
+          setWalletBalanceEth(msg.nativeTokenBalance ?? null);
         }
       } catch {}
     };
@@ -370,7 +527,7 @@ export default function Home() {
              </Box>
              
              {/* Wallet Connection */}
-             <Box>
+             <Flex align="center" gap={3}>
                {walletAddress ? (
                  <Flex align="center" gap={3}>
                    <Box
@@ -418,20 +575,95 @@ export default function Home() {
                    {isConnecting ? "Connecting..." : "Connect Wallet"}
                  </Box>
                )}
-             </Box>
+
+               {/* Chain Selection Dropdown */}
+               <Box position="relative" data-dropdown>
+                 <Box
+                   as="button"
+                   px={3}
+                   py={2}
+                   bg={currentChainName === "BNB" ? "yellow.500" : "blue.500"}
+                   color="white"
+                   borderRadius="md"
+                   fontSize="sm"
+                   fontWeight="medium"
+                   cursor="pointer"
+                   _hover={{ bg: currentChainName === "BNB" ? "yellow.600" : "blue.600" }}
+                   onClick={(e) => {
+                     e.stopPropagation();
+                     setIsChainDropdownOpen(!isChainDropdownOpen);
+                   }}
+                   display="flex"
+                   alignItems="center"
+                   gap={2}
+                 >
+                   {currentChainName === "BNB" ? "🟡" : "🔷"} {currentChainName}
+                   <Box fontSize="xs" transform={isChainDropdownOpen ? "rotate(180deg)" : "rotate(0deg)"} transition="transform 0.2s">▼</Box>
+                 </Box>
+                 
+                 {isChainDropdownOpen && (
+                   <Box
+                     position="absolute"
+                     top="100%"
+                     right={0}
+                     mt={1}
+                     bg="white"
+                     border="1px solid"
+                     borderColor="gray.200"
+                     borderRadius="md"
+                     boxShadow="lg"
+                     zIndex={1000}
+                     minW="150px"
+                   >
+                     <Box
+                       px={3}
+                       py={2}
+                       cursor="pointer"
+                       _hover={{ bg: "gray.100" }}
+                       onClick={(e) => {
+                         e.stopPropagation();
+                         switchChain('0x1');
+                       }}
+                       borderBottom="1px solid"
+                       borderColor="gray.200"
+                     >
+                       <Flex align="center" gap={2}>
+                         🔷 Ethereum
+                       </Flex>
+                     </Box>
+                     <Box
+                       px={3}
+                       py={2}
+                       cursor="pointer"
+                       _hover={{ bg: "gray.100" }}
+                       onClick={(e) => {
+                         e.stopPropagation();
+                         switchChain('0x38');
+                       }}
+                     >
+                       <Flex align="center" gap={2}>
+                         🟡 BSC
+                       </Flex>
+                     </Box>
+                   </Box>
+                 )}
+               </Box>
+             </Flex>
            </Flex>
           {/* Global Stats Bar */}
           <Box mb={4}>
             <Flex gap={3} align="center" wrap="wrap">
               <Box px={3} py={2} color="white" borderRadius="md" fontSize="sm" border="1px solid" borderColor="gray.200">
-                🔷 ETH: {ethPriceUSD !== null ? `$${ethPriceUSD.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}
+                🔷 {currentChainName}: {ethPriceUSD !== null ? `$${ethPriceUSD.toLocaleString(undefined, { maximumFractionDigits: 2 })}` : "—"}
               </Box>
               <Box px={3} py={2} color="white" borderRadius="md" fontSize="sm" border="1px solid" borderColor="gray.200">
                 ⛽ Gas: {gasPriceGwei !== null ? `${gasPriceGwei.toFixed(1)} gwei` : "—"}
               </Box>
               <Box px={3} py={2} color="white" borderRadius="md" fontSize="sm" border="1px solid" borderColor="gray.200">
-                👛 Balance: {walletAddress ? (walletBalanceEth !== null ? `${walletBalanceEth.toFixed(4)} ETH` : "—") : "Connect wallet"}
+                👛 Balance: {walletAddress ? (walletBalanceEth !== null ? `${walletBalanceEth.toFixed(4)} ${currentChainName}` : "—") : "Connect wallet"}
               </Box>
+
+              
             </Flex>
           </Box>
 
@@ -543,6 +775,7 @@ export default function Home() {
                </Box>
              </Box>
            )}
+
         </Box>
         <Box
           w={{ base: "100%", md: "20%" }}
@@ -559,6 +792,9 @@ export default function Home() {
             <Box fontSize="lg" fontWeight="bold" color="gray.200" as="h2">
               🔔 Live Notifications
             </Box>
+            <Box fontSize="sm" color="gray.400" mt={1}>
+              Tracking ERC20 (Ethereum) & BEP20 (BSC) tokens
+            </Box>
           </Box>
           {trackerData.length > 0 ? (
             <Box>
@@ -567,19 +803,19 @@ export default function Home() {
                   key={index}
                   mb={3}
                   p={3}
-                  bg={selectedMessages.has(index) ? "blue.900" : "gray.800"}
+                  bg={selectedMessages.has(index) ? (data.chainName === "BSC" ? "yellow.900" : "blue.900") : "gray.800"}
                   borderRadius="lg"
                   boxShadow="sm"
                   borderLeft="4px solid"
-                  borderLeftColor={selectedMessages.has(index) ? "blue.300" : "blue.400"}
+                  borderLeftColor={selectedMessages.has(index) ? (data.chainName === "BSC" ? "yellow.300" : "blue.300") : (data.chainName === "BSC" ? "yellow.400" : "blue.400")}
                   position="relative"
                   cursor="pointer"
-                  _hover={{ transform: "translateY(-1px)", boxShadow: "md", bg: selectedMessages.has(index) ? "blue.800" : "gray.750" }}
+                  _hover={{ transform: "translateY(-1px)", boxShadow: "md", bg: selectedMessages.has(index) ? (data.chainName === "BSC" ? "yellow.800" : "blue.800") : "gray.750" }}
                   transition="all 0.2s"
                   className="notification-enter"
                   onClick={() => toggleMessageSelection(index)}
                   border={selectedMessages.has(index) ? "2px solid" : "none"}
-                  borderColor={selectedMessages.has(index) ? "blue.300" : "transparent"}
+                  borderColor={selectedMessages.has(index) ? (data.chainName === "BSC" ? "yellow.300" : "blue.300") : "transparent"}
                 >
                   <Flex align="center" mb={2}>
                     {isSelectionMode && (
@@ -602,7 +838,7 @@ export default function Home() {
                     <Box
                       w={2}
                       h={2}
-                      bg="green.400"
+                      bg={data.chainName === "BSC" ? "yellow.400" : "green.400"}
                       borderRadius="full"
                       mr={2}
                       animation="pulse 2s infinite"
@@ -614,14 +850,14 @@ export default function Home() {
 
                   <Box mb={3}>
                     <Flex align="center" gap={2} mb={2}>
-                      <Box fontSize="sm" fontWeight="bold" color="blue.300">
-                        🔷 New ERC20 Token Created
+                      <Box fontSize="sm" fontWeight="bold" color={data.chainName === "BSC" ? "yellow.300" : "blue.300"}>
+                        {data.chainName === "BSC" ? "🟡 New BEP20 Token Created" : "🔷 New ERC20 Token Created"}
                       </Box>
                     </Flex>
 
                     <Flex
                       fontSize="sm"
-                      color="blue.400"
+                      color={data.chainName === "BSC" ? "yellow.400" : "blue.400"}
                       fontFamily="mono"
                       cursor="pointer"
                       p={2}
@@ -630,9 +866,9 @@ export default function Home() {
                       border="1px solid"
                       borderColor="gray.600"
                       _hover={{
-                        color: "blue.200",
+                        color: data.chainName === "BSC" ? "yellow.200" : "blue.200",
                         bg: "gray.650",
-                        borderColor: "blue.500"
+                        borderColor: data.chainName === "BSC" ? "yellow.500" : "blue.500"
                       }}
                       onClick={(e) => {
                         e.stopPropagation();
@@ -661,15 +897,18 @@ export default function Home() {
                     <Flex align="left" direction="column" gap={2} mb={2}>
                       <Box
                         fontSize="xs"
-                        color="blue.400"
+                        color={data.chainName === "BSC" ? "yellow.400" : "blue.400"}
                         cursor="pointer"
-                        _hover={{ color: "blue.200", textDecoration: "underline" }}
+                        _hover={{ color: data.chainName === "BSC" ? "yellow.200" : "blue.200", textDecoration: "underline" }}
                         onClick={(e) => {
                           e.stopPropagation();
-                          window.open(`https://etherscan.io/address/${data.address}`, '_blank');
+                          const explorerUrl = data.chainName === "BSC" 
+                            ? `https://bscscan.com/address/${data.address}` 
+                            : `https://etherscan.io/address/${data.address}`;
+                          window.open(explorerUrl, '_blank');
                         }}
                       >
-                        🔗 View on Etherscan
+                        🔗 View on {data.chainName === "BSC" ? "BSCScan" : "Etherscan"}
                       </Box>
                       <Box fontSize="xs" color="gray.400">
                         • Block #{data.blockNumber}
@@ -688,7 +927,7 @@ export default function Home() {
             >
               <Box mb={2}>🔍</Box>
               <Box>Waiting for new tokens...</Box>
-              <Box fontSize="xs" mt={1}>Watching blockchain in real-time</Box>
+              <Box fontSize="xs" mt={1}>Watching Ethereum & BSC blockchains in real-time</Box>
             </Box>
           )}
 
